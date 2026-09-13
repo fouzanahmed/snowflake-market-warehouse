@@ -1,0 +1,28 @@
+-- Incremental propagation from RAW into STAGING using a Stream (captures
+-- new/changed rows since the last consumption) and a Task (runs on a
+-- schedule and only fires when the stream actually has data).
+
+CREATE STREAM IF NOT EXISTS MARKET_DW.RAW.PRICES_STREAM
+    ON TABLE MARKET_DW.RAW.PRICES;
+
+CREATE TASK IF NOT EXISTS MARKET_DW.RAW.REFRESH_STAGING_TASK
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = 'USING CRON 0 6 * * * UTC'
+    WHEN SYSTEM$STREAM_HAS_DATA('MARKET_DW.RAW.PRICES_STREAM')
+AS
+    MERGE INTO MARKET_DW.STAGING.STG_PRICES AS tgt
+    USING (
+        SELECT TICKER, DATE, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME
+        FROM MARKET_DW.RAW.PRICES_STREAM
+        WHERE METADATA$ACTION = 'INSERT'
+    ) AS src
+    ON tgt.TICKER = src.TICKER AND tgt.DATE = src.DATE
+    WHEN MATCHED THEN UPDATE SET
+        OPEN = src.OPEN, HIGH = src.HIGH, LOW = src.LOW,
+        CLOSE = src.CLOSE, ADJ_CLOSE = src.ADJ_CLOSE, VOLUME = src.VOLUME
+    WHEN NOT MATCHED THEN INSERT
+        (TICKER, DATE, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME)
+        VALUES (src.TICKER, src.DATE, src.OPEN, src.HIGH, src.LOW, src.CLOSE, src.ADJ_CLOSE, src.VOLUME);
+
+-- Tasks are created suspended by default:
+ALTER TASK MARKET_DW.RAW.REFRESH_STAGING_TASK RESUME;

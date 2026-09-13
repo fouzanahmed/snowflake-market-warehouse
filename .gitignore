@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/
+data_incr/
+yf_cache/
+*.csv.gz
+.ruff_cache/
