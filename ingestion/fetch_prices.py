@@ -41,6 +41,11 @@ BATCH_SIZE = 40
 
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
+REQUIRED_COLUMNS = [
+    "TICKER", "DATE", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME",
+]
+OHLCV_COLUMNS = ["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]
+
 # Fallback so a fresh clone isn't blocked by a Wikipedia layout change.
 FALLBACK_TICKERS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "JPM",
@@ -97,6 +102,49 @@ def tidy_batch(raw: pd.DataFrame, batch: list[str]) -> pd.DataFrame | None:
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
+def validate_before_write(df: pd.DataFrame) -> list[str]:
+    """
+    Final gate before writing load files. Catches the case where a Yahoo
+    Finance API/schema change or a partial batch failure would otherwise
+    silently produce bad load files -- missing columns, an empty frame,
+    OHLCV rows that are entirely null, or duplicate (TICKER, DATE) rows.
+
+    Returns a list of error messages; empty means the frame is fit to write.
+    """
+    errors = []
+
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        errors.append(f"Missing required columns: {missing}. Got: {list(df.columns)}")
+        return errors  # nothing else below is safe to check without these columns
+
+    if df.empty:
+        errors.append("No rows to write.")
+        return errors
+
+    fully_null = df[OHLCV_COLUMNS].isna().all(axis=1)
+    if fully_null.any():
+        errors.append(
+            f"{int(fully_null.sum())} row(s) have fully-null OHLCV data "
+            f"(OPEN, HIGH, LOW, CLOSE, VOLUME all missing)."
+        )
+
+    if df["TICKER"].isna().any() or df["DATE"].isna().any():
+        errors.append("Found null TICKER or DATE values.")
+
+    dup_count = int(df.duplicated(subset=["TICKER", "DATE"]).sum())
+    if dup_count:
+        errors.append(f"{dup_count} duplicate (TICKER, DATE) row(s) found.")
+
+    numeric_cols = ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
+    negative = (df[numeric_cols] < 0).any()
+    if negative.any():
+        bad_cols = negative[negative].index.tolist()
+        errors.append(f"Negative values found in columns: {bad_cols}")
+
+    return errors
+
+
 def main() -> int:
     OUT_DIR.mkdir(exist_ok=True)
     tickers = get_tickers()
@@ -142,14 +190,13 @@ def main() -> int:
     if "ADJ_CLOSE" not in df.columns:
         df["ADJ_CLOSE"] = df["CLOSE"]
 
-    wanted = ["TICKER", "DATE", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
-    missing = [c for c in wanted if c not in df.columns]
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         print(f"Missing expected columns: {missing}")
         print(f"Got: {list(df.columns)}")
         return 1
 
-    df = df[wanted]
+    df = df[REQUIRED_COLUMNS]
     df = df.dropna(subset=["CLOSE"])
     df["DATE"] = pd.to_datetime(df["DATE"], utc=True, errors="coerce").dt.date
     df = df.dropna(subset=["DATE"])
@@ -158,6 +205,15 @@ def main() -> int:
     for col in ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE"]:
         df[col] = df[col].astype(float).round(6)
     df["VOLUME"] = df["VOLUME"].fillna(0).astype("int64")
+
+    # Final safety net -- catches a Yahoo API/schema change or a partial batch
+    # failure that would otherwise silently write bad data into the load files.
+    errors = validate_before_write(df)
+    if errors:
+        print("Validation failed; refusing to write output files:")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
 
     # Shuffle, then split -- see module docstring for why
     df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
