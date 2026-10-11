@@ -1,7 +1,14 @@
-pandas==2.2.3
-numpy>=1.26.0
-requests==2.32.3
+# Extract
 yfinance>=0.2.40
-scikit-learn>=1.4.0
-python-dotenv==1.0.1
-snowflake-connector-python>=3.10.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+
+# Required by pandas.read_html for the Wikipedia constituent table.
+# Without these the script silently falls back to a 50-ticker list.
+lxml>=4.9.0
+html5lib>=1.1
+beautifulsoup4>=4.12.0
+
+# Optional: only needed to drive Snowflake from Python rather than SnowSQL
+snowflake-connector-python>=3.0.0

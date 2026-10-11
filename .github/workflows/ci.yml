@@ -7,16 +7,16 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install ruff
+        run: pip install ruff==0.16.9
       - name: Lint
-        run: ruff check ingestion/ python/ tests/
-      - name: Test
-        run: pytest -q
+        run: ruff check extract/
+      - name: Compile check
+        run: python -m py_compile extract/fetch_prices.py

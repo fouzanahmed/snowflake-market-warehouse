@@ -1,10 +1,27 @@
+# Data extracts - regenerate with extract/fetch_prices.py, never commit
+data/
+*.csv
+*.csv.gz
+yf_cache/
+
+# Credentials - never commit
+.env
+*.pem
+*.p8
+config
+profiles.yml
+.snowsql/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
-.env
-data/
-data_incr/
-yf_cache/
-*.csv.gz
-.ruff_cache/
+env/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
