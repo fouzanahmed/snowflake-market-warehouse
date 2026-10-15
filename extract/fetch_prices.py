@@ -203,8 +203,11 @@ def main() -> int:
     # Shuffle, then split -- see module docstring for why
     df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
 
+    # Split row positions rather than the frame itself: on recent numpy/pandas,
+    # np.array_split(df, n) returns bare ndarrays, which have no .to_csv.
     print()
-    for k, part in enumerate(np.array_split(df, N_OUTPUT_FILES)):
+    for k, rows in enumerate(np.array_split(np.arange(len(df)), N_OUTPUT_FILES)):
+        part = df.iloc[rows]
         path = OUT_DIR / f"{FILE_PREFIX}_{k:02d}.csv.gz"
         part.to_csv(path, index=False, compression="gzip")
         print(f"  wrote {path}  ({len(part):,} rows)")
