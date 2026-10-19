@@ -36,6 +36,7 @@ Windows notes (both of these cost real debugging time):
 """
 
 import sys
+import time
 from contextlib import suppress
 from io import StringIO
 from pathlib import Path
@@ -51,6 +52,8 @@ import yfinance as yf
 START = "2015-01-01"
 END = "2025-12-31"
 BATCH_SIZE = 40  # tickers per yfinance call
+MAX_ATTEMPTS = 4  # per batch, including the first try
+BACKOFF_BASE_S = 2.0  # waits 2s, 4s, 8s between attempts
 N_OUTPUT_FILES = 10
 OUT_DIR = Path("data")
 FILE_PREFIX = "prices"
@@ -127,6 +130,51 @@ def tidy_batch(raw: pd.DataFrame, batch: list) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
+def download_batch(batch: list) -> pd.DataFrame | None:
+    """
+    yf.download with retry and exponential backoff. yfinance often swallows
+    a transient Yahoo error and returns an empty frame instead of raising, so
+    an empty result is retried too. Returns None if every attempt fails.
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            raw = yf.download(
+                batch,
+                start=START,
+                end=END,
+                auto_adjust=False,   # keeps a separate 'Adj Close' column
+                group_by="ticker",
+                threads=False,       # avoids the SQLite lock on Windows
+                progress=False,
+            )
+            if raw is not None and not raw.empty:
+                return raw
+            reason = "returned nothing"
+        except Exception as exc:  # noqa: BLE001
+            reason = f"failed: {exc}"
+
+        if attempt < MAX_ATTEMPTS:
+            wait = BACKOFF_BASE_S * 2 ** (attempt - 1)
+            print(f"  attempt {attempt}/{MAX_ATTEMPTS} {reason}; retrying in {wait:.0f}s")
+            time.sleep(wait)
+        else:
+            print(f"  attempt {attempt}/{MAX_ATTEMPTS} {reason}; giving up")
+
+    return None
+
+
+def report_failed_batches(failed_batches: list) -> None:
+    """List batches that never succeeded, so a partial run can't pass as complete."""
+    if not failed_batches:
+        return
+    n_tickers = sum(len(batch) for _, batch in failed_batches)
+    print(f"\n!! {len(failed_batches)} batch(es) failed after {MAX_ATTEMPTS} attempts "
+          f"-- {n_tickers} ticker(s) missing from the output:")
+    for i, batch in failed_batches:
+        print(f"!!   batch at {i}: {', '.join(batch)}")
+    print("!! Re-run the script to fetch them.")
+
+
 def main() -> int:
     OUT_DIR.mkdir(exist_ok=True)
 
@@ -138,24 +186,13 @@ def main() -> int:
     tickers = constituents["TICKER"].tolist()
 
     chunks = []
+    failed_batches = []
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i:i + BATCH_SIZE]
-        try:
-            raw = yf.download(
-                batch,
-                start=START,
-                end=END,
-                auto_adjust=False,   # keeps a separate 'Adj Close' column
-                group_by="ticker",
-                threads=False,       # avoids the SQLite lock on Windows
-                progress=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"  batch at {i} failed: {exc}")
-            continue
-
-        if raw is None or raw.empty:
-            print(f"  batch at {i} returned nothing")
+        raw = download_batch(batch)
+        if raw is None:
+            print(f"  batch at {i} failed after {MAX_ATTEMPTS} attempts")
+            failed_batches.append((i, batch))
             continue
 
         tidied = tidy_batch(raw, batch)
@@ -166,6 +203,7 @@ def main() -> int:
 
     if not chunks:
         print("No data downloaded. Check network / yfinance version.")
+        report_failed_batches(failed_batches)
         return 1
 
     df = pd.concat(chunks, ignore_index=True)
@@ -194,8 +232,10 @@ def main() -> int:
     df["VOLUME"] = df["VOLUME"].fillna(0).astype("int64")
 
     # Report tickers with no price history rather than failing the batch
+    # (tickers from failed batches are reported separately, below)
     got = set(df["TICKER"].unique())
-    dropped = [t for t in tickers if t not in got]
+    in_failed_batches = {t for _, batch in failed_batches for t in batch}
+    dropped = [t for t in tickers if t not in got and t not in in_failed_batches]
     if dropped:
         print(f"\nNo price history for {len(dropped)} ticker(s): {', '.join(dropped)}")
         print("(usually recent index additions whose symbol has no back-series)")
@@ -222,6 +262,7 @@ def main() -> int:
         f"\nDone. {len(df):,} rows | {df['TICKER'].nunique()} tickers | "
         f"{df['DATE'].min()} to {df['DATE'].max()}"
     )
+    report_failed_batches(failed_batches)
     return 0
 
 

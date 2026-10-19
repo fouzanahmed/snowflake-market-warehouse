@@ -83,6 +83,60 @@ def test_tidy_batch_flat_columns_single_ticker():
 
 
 # ---------------------------------------------------------------------------
+# download_batch: retry with exponential backoff
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def sleeps(monkeypatch):
+    """Record backoff waits instead of sleeping."""
+    waits = []
+    monkeypatch.setattr(fp.time, "sleep", waits.append)
+    return waits
+
+
+def flaky_download(outcomes):
+    """A yf.download stand-in that plays back outcomes, one per call."""
+    calls = []
+
+    def _download(batch, **_kwargs):
+        calls.append(list(batch))
+        outcome = outcomes[len(calls) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return _download, calls
+
+
+def test_download_batch_retries_then_succeeds(monkeypatch, sleeps):
+    good = make_raw(["AAA"])
+    download, calls = flaky_download([RuntimeError("503"), pd.DataFrame(), good])
+    monkeypatch.setattr(fp.yf, "download", download)
+
+    assert fp.download_batch(["AAA"]) is good
+    assert len(calls) == 3
+    assert sleeps == [fp.BACKOFF_BASE_S, fp.BACKOFF_BASE_S * 2]
+
+
+def test_download_batch_gives_up_after_max_attempts(monkeypatch, sleeps):
+    download, calls = flaky_download([RuntimeError("503")] * fp.MAX_ATTEMPTS)
+    monkeypatch.setattr(fp.yf, "download", download)
+
+    assert fp.download_batch(["AAA"]) is None
+    assert len(calls) == fp.MAX_ATTEMPTS
+    # Exponential, and no wait after the final attempt
+    assert sleeps == [fp.BACKOFF_BASE_S * 2 ** k for k in range(fp.MAX_ATTEMPTS - 1)]
+
+
+def test_download_batch_no_wait_on_first_success(monkeypatch, sleeps):
+    download, calls = flaky_download([make_raw(["AAA"])])
+    monkeypatch.setattr(fp.yf, "download", download)
+
+    assert fp.download_batch(["AAA"]) is not None
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
 # main(): shuffle + split into N_OUTPUT_FILES
 # ---------------------------------------------------------------------------
 TICKERS = ["AAA", "BBB", "CCC", "NODATA"]
@@ -169,3 +223,38 @@ def test_main_ticker_dimension_excludes_tickers_without_history(run_main):
     dim = pd.read_csv(run_main() / "tickers.csv.gz")
 
     assert dim["TICKER"].tolist() == ["AAA", "BBB", "CCC"]
+
+
+def test_main_lists_batches_that_still_failed(run_main, monkeypatch, sleeps, capsys):
+    def download(batch, **_kwargs):
+        if "CCC" in batch:                      # second batch: CCC, NODATA
+            raise RuntimeError("503")
+        return make_raw(batch, n_days=N_DAYS)
+
+    monkeypatch.setattr(fp.yf, "download", download)
+    _, parts = read_parts(run_main())
+    out = capsys.readouterr().out
+
+    assert set(pd.concat(parts)["TICKER"]) == {"AAA", "BBB"}
+    assert len(sleeps) == fp.MAX_ATTEMPTS - 1
+    assert "1 batch(es) failed" in out
+    assert "batch at 2: CCC, NODATA" in out
+    # Failed-batch tickers aren't misreported as having no price history
+    assert "No price history" not in out
+
+
+def test_main_all_batches_failed_returns_1_and_lists_them(
+        tmp_path, monkeypatch, sleeps, capsys):
+    download, _ = flaky_download([RuntimeError("503")] * fp.MAX_ATTEMPTS * 2)
+    monkeypatch.setattr(fp.yf, "download", download)
+    monkeypatch.setattr(fp, "get_constituents",
+                        lambda: pd.DataFrame({"TICKER": TICKERS}))
+    monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
+    monkeypatch.setattr(fp, "BATCH_SIZE", 2)
+    monkeypatch.setattr(fp, "OUT_DIR", tmp_path / "data")
+
+    assert fp.main() == 1
+    out = capsys.readouterr().out
+    assert "2 batch(es) failed" in out
+    assert "batch at 0: AAA, BBB" in out
+    assert "batch at 2: CCC, NODATA" in out
