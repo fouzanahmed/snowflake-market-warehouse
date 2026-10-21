@@ -6,7 +6,7 @@ Finance, and writes N gzipped CSVs ready for PUT + COPY INTO. Also writes a
 small ticker/sector file used by the dimensional model.
 
     pip install -r requirements.txt
-    python extract/fetch_prices.py
+    python extract/fetch_prices.py [--allow-fallback]
 
 Measured output (2015-01-01 to 2025-12-31):
     1,338,849 rows | 501 tickers | 10 files | ~38 MB gzipped
@@ -27,7 +27,8 @@ Windows notes (both of these cost real debugging time):
   - Wikipedia's table needs an HTML parser (lxml / html5lib / bs4). Without
     one, pd.read_html raises and the script falls back to a hardcoded list of
     50 tickers -- a SILENT degradation that looks like success. The row count
-    is the only signal. A silent fallback is worse than a crash.
+    is the only signal. A silent fallback is worse than a crash, so the
+    script now exits 1 instead, unless --allow-fallback is passed.
 
   - yfinance caches timezone data in SQLite. With threads=True, parallel
     workers contend for the file and tickers fail with
@@ -35,6 +36,7 @@ Windows notes (both of these cost real debugging time):
     directory and running single-threaded is slower but complete.
 """
 
+import argparse
 import sys
 import time
 from contextlib import suppress
@@ -61,8 +63,8 @@ TZ_CACHE = "./yf_cache"
 
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
-# Fallback so a Wikipedia layout change never blocks the build entirely.
-# If you end up here you'll get ~50 tickers, not ~500 -- check the log.
+# Opt-in fallback (--allow-fallback) so a Wikipedia layout change need not
+# block the build entirely. You'll get ~50 tickers, not ~500 -- check the log.
 FALLBACK_TICKERS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "JPM",
     "V", "UNH", "XOM", "JNJ", "WMT", "MA", "PG", "AVGO", "HD", "CVX", "LLY",
@@ -72,8 +74,12 @@ FALLBACK_TICKERS = [
 ]
 
 
-def get_constituents() -> pd.DataFrame:
-    """S&P 500 constituents with sector, plus a hardcoded fallback."""
+def get_constituents(allow_fallback: bool = False) -> pd.DataFrame | None:
+    """
+    S&P 500 constituents with sector. If the Wikipedia fetch fails, returns
+    the hardcoded fallback only when allow_fallback is set; otherwise None,
+    so the run stops instead of silently building a ~50-ticker dataset.
+    """
     try:
         resp = requests.get(
             WIKI_SP500,
@@ -95,8 +101,12 @@ def get_constituents() -> pd.DataFrame:
 
     except Exception as exc:  # noqa: BLE001
         print(f"!! Wikipedia fetch failed ({exc})")
-        print(f"!! Falling back to {len(FALLBACK_TICKERS)} hardcoded tickers.")
         print("!! Install an HTML parser to fix: pip install lxml html5lib beautifulsoup4")
+        if not allow_fallback:
+            print(f"!! Not falling back to the {len(FALLBACK_TICKERS)} hardcoded tickers. "
+                  "Pass --allow-fallback to build from them anyway.")
+            return None
+        print(f"!! Falling back to {len(FALLBACK_TICKERS)} hardcoded tickers (--allow-fallback).")
         return pd.DataFrame({
             "TICKER": FALLBACK_TICKERS,
             "COMPANY_NAME": [None] * len(FALLBACK_TICKERS),
@@ -175,14 +185,28 @@ def report_failed_batches(failed_batches: list) -> None:
     print("!! Re-run the script to fetch them.")
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build the load files for the Snowflake Market Data Warehouse.")
+    parser.add_argument(
+        "--allow-fallback",
+        action="store_true",
+        help=f"if the Wikipedia constituent fetch fails, build from the "
+             f"{len(FALLBACK_TICKERS)} hardcoded tickers instead of exiting 1",
+    )
+    return parser.parse_args(argv)
+
+
+def main(allow_fallback: bool = False) -> int:
     OUT_DIR.mkdir(exist_ok=True)
 
     # Keep the tz cache local and off the shared default path
     with suppress(AttributeError):  # older yfinance has no set_tz_cache_location
         yf.set_tz_cache_location(TZ_CACHE)
 
-    constituents = get_constituents()
+    constituents = get_constituents(allow_fallback=allow_fallback)
+    if constituents is None:
+        return 1
     tickers = constituents["TICKER"].tolist()
 
     chunks = []
@@ -267,4 +291,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(allow_fallback=parse_args().allow_fallback))

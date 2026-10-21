@@ -154,7 +154,7 @@ def run_main(tmp_path, monkeypatch):
         "COMPANY_NAME": [f"{t} Inc" for t in TICKERS],
         "SECTOR": ["Tech"] * len(TICKERS),
     })
-    monkeypatch.setattr(fp, "get_constituents", lambda: constituents)
+    monkeypatch.setattr(fp, "get_constituents", lambda **_kwargs: constituents)
     monkeypatch.setattr(fp.yf, "download", fake_download)
     monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
     monkeypatch.setattr(fp, "BATCH_SIZE", 2)    # exercise more than one batch
@@ -248,7 +248,7 @@ def test_main_all_batches_failed_returns_1_and_lists_them(
     download, _ = flaky_download([RuntimeError("503")] * fp.MAX_ATTEMPTS * 2)
     monkeypatch.setattr(fp.yf, "download", download)
     monkeypatch.setattr(fp, "get_constituents",
-                        lambda: pd.DataFrame({"TICKER": TICKERS}))
+                        lambda **_kwargs: pd.DataFrame({"TICKER": TICKERS}))
     monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
     monkeypatch.setattr(fp, "BATCH_SIZE", 2)
     monkeypatch.setattr(fp, "OUT_DIR", tmp_path / "data")
@@ -258,3 +258,56 @@ def test_main_all_batches_failed_returns_1_and_lists_them(
     assert "2 batch(es) failed" in out
     assert "batch at 0: AAA, BBB" in out
     assert "batch at 2: CCC, NODATA" in out
+
+
+# ---------------------------------------------------------------------------
+# Constituent fallback: exit 1 unless --allow-fallback
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def wikipedia_down(monkeypatch):
+    def _fail(*_args, **_kwargs):
+        raise ImportError("Missing optional dependency 'lxml'")
+
+    monkeypatch.setattr(fp.requests, "get", _fail)
+
+
+def test_get_constituents_refuses_fallback_by_default(wikipedia_down, capsys):
+    assert fp.get_constituents() is None
+    assert "--allow-fallback" in capsys.readouterr().out
+
+
+def test_get_constituents_falls_back_when_allowed(wikipedia_down):
+    df = fp.get_constituents(allow_fallback=True)
+
+    assert df["TICKER"].tolist() == fp.FALLBACK_TICKERS
+
+
+def test_main_exits_1_on_fallback_without_downloading(
+        wikipedia_down, tmp_path, monkeypatch):
+    def download(*_args, **_kwargs):
+        raise AssertionError("should not download")
+
+    monkeypatch.setattr(fp.yf, "download", download)
+    monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
+    monkeypatch.setattr(fp, "OUT_DIR", tmp_path / "data")
+
+    assert fp.main() == 1
+    assert not list((tmp_path / "data").glob("*.csv.gz"))
+
+
+def test_main_allow_fallback_builds_from_fallback_tickers(
+        wikipedia_down, tmp_path, monkeypatch):
+    monkeypatch.setattr(fp, "FALLBACK_TICKERS", ["AAA", "BBB"])
+    monkeypatch.setattr(fp.yf, "download",
+                        lambda batch, **_kwargs: make_raw(batch, n_days=N_DAYS))
+    monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
+    monkeypatch.setattr(fp, "OUT_DIR", tmp_path / "data")
+
+    assert fp.main(allow_fallback=True) == 0
+    _, parts = read_parts(tmp_path / "data")
+    assert set(pd.concat(parts)["TICKER"]) == {"AAA", "BBB"}
+
+
+def test_parse_args_allow_fallback_flag():
+    assert fp.parse_args([]).allow_fallback is False
+    assert fp.parse_args(["--allow-fallback"]).allow_fallback is True

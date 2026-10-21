@@ -185,7 +185,13 @@ Two failures that cost real time, both now handled in the script:
 `html5lib`, `beautifulsoup4`). Without one it raises, the script falls back to a
 hardcoded 50-ticker list, and the run *looks successful* — the row count is the
 only signal. A silent fallback is worse than a crash, so the script now logs the
-failure loudly and the parsers are pinned in `requirements.txt`.
+failure loudly and exits 1 without downloading anything, and the parsers are
+pinned in `requirements.txt`. To build from the 50-ticker list anyway (say,
+because Wikipedia changed its table layout), opt in explicitly:
+
+```bash
+python extract/fetch_prices.py --allow-fallback
+```
 
 **`OperationalError('database is locked')`.** yfinance caches timezone data in
 SQLite; with `threads=True` parallel workers contend for the file and tickers
