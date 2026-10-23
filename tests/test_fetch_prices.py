@@ -9,6 +9,7 @@ shaped like what yfinance returns with group_by='ticker'.
 """
 
 import importlib.util
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -225,7 +226,7 @@ def test_main_ticker_dimension_excludes_tickers_without_history(run_main):
     assert dim["TICKER"].tolist() == ["AAA", "BBB", "CCC"]
 
 
-def test_main_lists_batches_that_still_failed(run_main, monkeypatch, sleeps, capsys):
+def test_main_lists_batches_that_still_failed(run_main, monkeypatch, sleeps, caplog):
     def download(batch, **_kwargs):
         if "CCC" in batch:                      # second batch: CCC, NODATA
             raise RuntimeError("503")
@@ -233,7 +234,7 @@ def test_main_lists_batches_that_still_failed(run_main, monkeypatch, sleeps, cap
 
     monkeypatch.setattr(fp.yf, "download", download)
     _, parts = read_parts(run_main())
-    out = capsys.readouterr().out
+    out = caplog.text
 
     assert set(pd.concat(parts)["TICKER"]) == {"AAA", "BBB"}
     assert len(sleeps) == fp.MAX_ATTEMPTS - 1
@@ -244,7 +245,7 @@ def test_main_lists_batches_that_still_failed(run_main, monkeypatch, sleeps, cap
 
 
 def test_main_all_batches_failed_returns_1_and_lists_them(
-        tmp_path, monkeypatch, sleeps, capsys):
+        tmp_path, monkeypatch, sleeps, caplog):
     download, _ = flaky_download([RuntimeError("503")] * fp.MAX_ATTEMPTS * 2)
     monkeypatch.setattr(fp.yf, "download", download)
     monkeypatch.setattr(fp, "get_constituents",
@@ -254,7 +255,7 @@ def test_main_all_batches_failed_returns_1_and_lists_them(
     monkeypatch.setattr(fp, "OUT_DIR", tmp_path / "data")
 
     assert fp.main() == 1
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "2 batch(es) failed" in out
     assert "batch at 0: AAA, BBB" in out
     assert "batch at 2: CCC, NODATA" in out
@@ -271,9 +272,17 @@ def wikipedia_down(monkeypatch):
     monkeypatch.setattr(fp.requests, "get", _fail)
 
 
-def test_get_constituents_refuses_fallback_by_default(wikipedia_down, capsys):
+def test_get_constituents_refuses_fallback_by_default(wikipedia_down, caplog):
     assert fp.get_constituents() is None
-    assert "--allow-fallback" in capsys.readouterr().out
+    assert "--allow-fallback" in caplog.text
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_get_constituents_fallback_warning_is_logged_at_warning(wikipedia_down, caplog):
+    fp.get_constituents(allow_fallback=True)
+
+    assert any(r.levelno == logging.WARNING and "Falling back" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_get_constituents_falls_back_when_allowed(wikipedia_down):
