@@ -37,6 +37,7 @@ Windows notes (both of these cost real debugging time):
 """
 
 import argparse
+import logging
 import sys
 import time
 from contextlib import suppress
@@ -62,6 +63,10 @@ FILE_PREFIX = "prices"
 TZ_CACHE = "./yf_cache"
 
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
+
+log = logging.getLogger(__name__)
 
 # Opt-in fallback (--allow-fallback) so a Wikipedia layout change need not
 # block the build entirely. You'll get ~50 tickers, not ~500 -- check the log.
@@ -96,17 +101,18 @@ def get_constituents(allow_fallback: bool = False) -> pd.DataFrame | None:
             "SECTOR": table["GICS Sector"].astype(str),
         }).drop_duplicates(subset=["TICKER"]).sort_values("TICKER")
 
-        print(f"Fetched {len(df)} constituents from Wikipedia")
+        log.info(f"Fetched {len(df)} constituents from Wikipedia")
         return df.reset_index(drop=True)
 
     except Exception as exc:  # noqa: BLE001
-        print(f"!! Wikipedia fetch failed ({exc})")
-        print("!! Install an HTML parser to fix: pip install lxml html5lib beautifulsoup4")
+        log.warning(f"Wikipedia fetch failed ({exc})")
+        log.warning("Install an HTML parser to fix: pip install lxml html5lib beautifulsoup4")
         if not allow_fallback:
-            print(f"!! Not falling back to the {len(FALLBACK_TICKERS)} hardcoded tickers. "
-                  "Pass --allow-fallback to build from them anyway.")
+            log.error(f"Not falling back to the {len(FALLBACK_TICKERS)} hardcoded tickers. "
+                      "Pass --allow-fallback to build from them anyway.")
             return None
-        print(f"!! Falling back to {len(FALLBACK_TICKERS)} hardcoded tickers (--allow-fallback).")
+        log.warning(f"Falling back to {len(FALLBACK_TICKERS)} hardcoded tickers "
+                    "(--allow-fallback).")
         return pd.DataFrame({
             "TICKER": FALLBACK_TICKERS,
             "COMPANY_NAME": [None] * len(FALLBACK_TICKERS),
@@ -165,10 +171,10 @@ def download_batch(batch: list) -> pd.DataFrame | None:
 
         if attempt < MAX_ATTEMPTS:
             wait = BACKOFF_BASE_S * 2 ** (attempt - 1)
-            print(f"  attempt {attempt}/{MAX_ATTEMPTS} {reason}; retrying in {wait:.0f}s")
+            log.warning(f"attempt {attempt}/{MAX_ATTEMPTS} {reason}; retrying in {wait:.0f}s")
             time.sleep(wait)
         else:
-            print(f"  attempt {attempt}/{MAX_ATTEMPTS} {reason}; giving up")
+            log.error(f"attempt {attempt}/{MAX_ATTEMPTS} {reason}; giving up")
 
     return None
 
@@ -178,11 +184,11 @@ def report_failed_batches(failed_batches: list) -> None:
     if not failed_batches:
         return
     n_tickers = sum(len(batch) for _, batch in failed_batches)
-    print(f"\n!! {len(failed_batches)} batch(es) failed after {MAX_ATTEMPTS} attempts "
-          f"-- {n_tickers} ticker(s) missing from the output:")
+    log.error(f"{len(failed_batches)} batch(es) failed after {MAX_ATTEMPTS} attempts "
+              f"-- {n_tickers} ticker(s) missing from the output:")
     for i, batch in failed_batches:
-        print(f"!!   batch at {i}: {', '.join(batch)}")
-    print("!! Re-run the script to fetch them.")
+        log.error(f"  batch at {i}: {', '.join(batch)}")
+    log.error("Re-run the script to fetch them.")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -215,7 +221,7 @@ def main(allow_fallback: bool = False) -> int:
         batch = tickers[i:i + BATCH_SIZE]
         raw = download_batch(batch)
         if raw is None:
-            print(f"  batch at {i} failed after {MAX_ATTEMPTS} attempts")
+            log.error(f"batch at {i} failed after {MAX_ATTEMPTS} attempts")
             failed_batches.append((i, batch))
             continue
 
@@ -223,10 +229,10 @@ def main(allow_fallback: bool = False) -> int:
         if tidied is not None:
             chunks.append(tidied)
 
-        print(f"  {min(i + BATCH_SIZE, len(tickers))}/{len(tickers)} tickers")
+        log.info(f"{min(i + BATCH_SIZE, len(tickers))}/{len(tickers)} tickers")
 
     if not chunks:
-        print("No data downloaded. Check network / yfinance version.")
+        log.error("No data downloaded. Check network / yfinance version.")
         report_failed_batches(failed_batches)
         return 1
 
@@ -242,8 +248,8 @@ def main(allow_fallback: bool = False) -> int:
     wanted = ["TICKER", "DATE", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
     missing = [c for c in wanted if c not in df.columns]
     if missing:
-        print(f"Missing expected columns: {missing}")
-        print(f"Got: {list(df.columns)}")
+        log.error(f"Missing expected columns: {missing}")
+        log.error(f"Got: {list(df.columns)}")
         return 1
 
     df = df[wanted].dropna(subset=["CLOSE"])
@@ -261,29 +267,28 @@ def main(allow_fallback: bool = False) -> int:
     in_failed_batches = {t for _, batch in failed_batches for t in batch}
     dropped = [t for t in tickers if t not in got and t not in in_failed_batches]
     if dropped:
-        print(f"\nNo price history for {len(dropped)} ticker(s): {', '.join(dropped)}")
-        print("(usually recent index additions whose symbol has no back-series)")
+        log.warning(f"No price history for {len(dropped)} ticker(s): {', '.join(dropped)}")
+        log.warning("(usually recent index additions whose symbol has no back-series)")
 
     # Shuffle, then split -- see module docstring for why
     df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
 
     # Split row positions rather than the frame itself: on recent numpy/pandas,
     # np.array_split(df, n) returns bare ndarrays, which have no .to_csv.
-    print()
     for k, rows in enumerate(np.array_split(np.arange(len(df)), N_OUTPUT_FILES)):
         part = df.iloc[rows]
         path = OUT_DIR / f"{FILE_PREFIX}_{k:02d}.csv.gz"
         part.to_csv(path, index=False, compression="gzip")
-        print(f"  wrote {path}  ({len(part):,} rows)")
+        log.info(f"wrote {path}  ({len(part):,} rows)")
 
     # Ticker dimension source, for the star schema
     dim_path = OUT_DIR / "tickers.csv.gz"
     constituents[constituents["TICKER"].isin(got)].to_csv(
         dim_path, index=False, compression="gzip")
-    print(f"  wrote {dim_path}  ({len(got):,} tickers)")
+    log.info(f"wrote {dim_path}  ({len(got):,} tickers)")
 
-    print(
-        f"\nDone. {len(df):,} rows | {df['TICKER'].nunique()} tickers | "
+    log.info(
+        f"Done. {len(df):,} rows | {df['TICKER'].nunique()} tickers | "
         f"{df['DATE'].min()} to {df['DATE'].max()}"
     )
     report_failed_batches(failed_batches)
@@ -291,4 +296,5 @@ def main(allow_fallback: bool = False) -> int:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     sys.exit(main(allow_fallback=parse_args().allow_fallback))
