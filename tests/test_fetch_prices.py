@@ -262,6 +262,99 @@ def test_main_all_batches_failed_returns_1_and_lists_them(
 
 
 # ---------------------------------------------------------------------------
+# main(): cleaning rules applied before the files are written
+# ---------------------------------------------------------------------------
+def patch_download(monkeypatch, transform):
+    """Serve make_raw() frames, passed through transform(raw) first."""
+    def download(batch, **_kwargs):
+        empty = [t for t in batch if t == "NODATA"]
+        return transform(make_raw(batch, n_days=N_DAYS, empty=empty))
+
+    monkeypatch.setattr(fp.yf, "download", download)
+
+
+def combined_output(out_dir):
+    _, parts = read_parts(out_dir)
+    return pd.concat(parts, ignore_index=True)
+
+
+def test_main_duplicate_ticker_date_keeps_last(run_main, monkeypatch):
+    def add_duplicate(raw):
+        dup = raw.iloc[[-1]].copy()
+        for tkr in dup.columns.get_level_values(0).unique():
+            if tkr != "NODATA":
+                dup[(tkr, "Close")] = -1.0          # marks the later copy
+        return pd.concat([raw, dup])
+
+    patch_download(monkeypatch, add_duplicate)
+    out = combined_output(run_main())
+
+    assert len(out) == (len(TICKERS) - 1) * N_DAYS
+    assert not out.duplicated(subset=["TICKER", "DATE"]).any()
+    last_day = out[out["DATE"] == out["DATE"].max()]
+    assert len(last_day) == len(TICKERS) - 1
+    assert (last_day["CLOSE"] == -1.0).all()
+
+
+def test_main_missing_adj_close_copies_close(run_main, monkeypatch):
+    patch_download(monkeypatch,
+                   lambda raw: raw.drop(columns="Adj Close", level=1))
+    out = combined_output(run_main())
+
+    assert list(out.columns) == WANTED
+    assert len(out) == (len(TICKERS) - 1) * N_DAYS
+    assert (out["ADJ_CLOSE"] == out["CLOSE"]).all()
+
+
+def test_main_nan_volume_becomes_zero_int(run_main, monkeypatch):
+    def blank_volume(raw):
+        raw.loc[raw.index[0], (slice(None), "Volume")] = np.nan
+        return raw
+
+    patch_download(monkeypatch, blank_volume)
+    out_dir = run_main()
+    out = combined_output(out_dir)
+
+    assert len(out) == (len(TICKERS) - 1) * N_DAYS
+    assert out["VOLUME"].dtype == np.int64
+    first_day = out[out["DATE"] == out["DATE"].min()]
+    assert (first_day["VOLUME"] == 0).all()
+    assert (out.loc[out["DATE"] != out["DATE"].min(), "VOLUME"] > 0).all()
+    # Written as integers, not "0.0", so COPY INTO into a NUMBER column is clean
+    _, parts = read_parts(out_dir)
+    assert all(part["VOLUME"].dtype == np.int64 for part in parts)
+
+
+def test_main_drops_rows_with_nan_close(run_main, monkeypatch):
+    def blank_close(raw):
+        raw.loc[raw.index[0], ("AAA", "Close")] = np.nan
+        return raw
+
+    patch_download(monkeypatch, blank_close)
+    out = combined_output(run_main())
+
+    assert len(out) == (len(TICKERS) - 1) * N_DAYS - 1
+    assert out["CLOSE"].notna().all()
+    aaa = out[out["TICKER"] == "AAA"]
+    assert len(aaa) == N_DAYS - 1
+    assert "2024-01-02" not in set(aaa["DATE"])
+
+
+def test_main_missing_required_column_returns_1(tmp_path, monkeypatch, caplog):
+    patch_download(monkeypatch, lambda raw: raw.drop(columns="Volume", level=1))
+    monkeypatch.setattr(fp, "get_constituents",
+                        lambda **_kwargs: pd.DataFrame({"TICKER": TICKERS}))
+    monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
+    monkeypatch.setattr(fp, "OUT_DIR", tmp_path / "data")
+
+    assert fp.main() == 1
+    assert any(r.levelno == logging.ERROR
+               and "Missing expected columns: ['VOLUME']" in r.getMessage()
+               for r in caplog.records)
+    assert not list((tmp_path / "data").glob("*.csv.gz"))
+
+
+# ---------------------------------------------------------------------------
 # Constituent fallback: exit 1 unless --allow-fallback
 # ---------------------------------------------------------------------------
 @pytest.fixture
