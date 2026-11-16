@@ -141,6 +141,13 @@ roadmap/    Later layers, each marked with its status in the header
 
 extract/
   fetch_prices.py             Constituent list + OHLCV download, file splitting
+
+tests/
+  test_fetch_prices.py        Offline unit tests for the extract script
+
+requirements.txt              Runtime dependencies for the extract script
+requirements-dev.txt          Runtime dependencies + pytest
+.github/workflows/ci.yml      Lint (ruff) and unit tests on every PR to main
 ```
 
 The split is deliberate. Everything in `sql/` was run, with its real output
@@ -174,6 +181,22 @@ TableScan node.
 
 **Enterprise edition** is needed for masking policies and 90-day Time Travel;
 Standard caps Time Travel at 1 day. Edition is fixed at signup.
+
+### Running the tests
+
+The tests cover `extract/fetch_prices.py` only. They run offline: the
+Wikipedia and yfinance calls are stubbed with `monkeypatch`, and yfinance
+downloads are replaced by small synthetic frames, so no network access is
+needed.
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+pip install ruff                        # CI pins the version in ci.yml
+ruff check extract/ tests/
+```
+
+CI runs the same lint and test steps on every push and pull request to `main`.
 
 ---
 
