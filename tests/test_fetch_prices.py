@@ -84,6 +84,101 @@ def test_tidy_batch_flat_columns_single_ticker():
 
 
 # ---------------------------------------------------------------------------
+# clean_prices: column normalisation and cleaning, no network or monkeypatching
+# ---------------------------------------------------------------------------
+def make_tidy(**overrides):
+    """A frame shaped like concatenated tidy_batch output (yfinance field names)."""
+    data = {
+        "TICKER": ["AAA", "AAA", "BBB"],
+        "Date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-02"]),
+        "Open": [1.0, 2.0, 3.0],
+        "High": [1.5, 2.5, 3.5],
+        "Low": [0.5, 1.5, 2.5],
+        "Close": [1.2, 2.2, 3.2],
+        "Adj Close": [1.1, 2.1, 3.1],
+        "Volume": [100.0, 200.0, 300.0],
+    }
+    data.update(overrides)
+    return pd.DataFrame(data)
+
+
+def test_clean_prices_normalises_schema_and_types():
+    out = fp.clean_prices(make_tidy())
+
+    assert list(out.columns) == fp.PRICE_COLUMNS == WANTED
+    assert out["DATE"].tolist() == [pd.Timestamp(d).date() for d in
+                                    ["2024-01-02", "2024-01-03", "2024-01-02"]]
+    assert out["ADJ_CLOSE"].tolist() == [1.1, 2.1, 3.1]
+    assert out["VOLUME"].dtype == "int64"
+    for col in ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE"]:
+        assert out[col].dtype == float
+
+
+def test_clean_prices_does_not_mutate_input():
+    raw = make_tidy()
+    before = raw.copy()
+    fp.clean_prices(raw)
+
+    pd.testing.assert_frame_equal(raw, before)
+
+
+def test_clean_prices_renames_datetime_to_date():
+    raw = make_tidy().rename(columns={"Date": "Datetime"})
+    out = fp.clean_prices(raw)
+
+    assert "DATE" in out.columns
+    assert len(out) == 3
+
+
+def test_clean_prices_adj_close_falls_back_to_close():
+    raw = make_tidy().drop(columns=["Adj Close"])
+    out = fp.clean_prices(raw)
+
+    assert out["ADJ_CLOSE"].tolist() == out["CLOSE"].tolist()
+
+
+def test_clean_prices_returns_none_on_missing_column(caplog):
+    raw = make_tidy().drop(columns=["Volume"])
+
+    assert fp.clean_prices(raw) is None
+    assert "Missing expected columns: ['VOLUME']" in caplog.text
+
+
+def test_clean_prices_drops_nan_close_and_bad_dates():
+    raw = make_tidy(Close=[1.2, np.nan, 3.2],
+                    Date=["2024-01-02", "2024-01-03", "not a date"])
+    out = fp.clean_prices(raw)
+
+    assert out["TICKER"].tolist() == ["AAA"]
+    assert out["CLOSE"].tolist() == [1.2]
+
+
+def test_clean_prices_dedupes_on_ticker_date_keeping_last():
+    raw = make_tidy(TICKER=["AAA", "AAA", "AAA"],
+                    Date=pd.to_datetime(["2024-01-02"] * 3),
+                    Close=[1.0, 2.0, 3.0])
+    out = fp.clean_prices(raw)
+
+    assert len(out) == 1
+    assert out["CLOSE"].iloc[0] == 3.0
+
+
+def test_clean_prices_utc_dates_rounding_and_volume_fill():
+    raw = make_tidy(
+        Date=pd.to_datetime(["2024-01-02 23:00"] * 3).tz_localize("America/New_York")
+        + pd.to_timedelta([0, 1, 2], unit="D"),
+        Close=[1.23456789, 2.0, 3.0],
+        Volume=[np.nan, 200.0, 300.0],
+    )
+    out = fp.clean_prices(raw)
+
+    # 23:00 New York is the next calendar day in UTC
+    assert str(out["DATE"].iloc[0]) == "2024-01-03"
+    assert out["CLOSE"].iloc[0] == pytest.approx(1.234568, abs=1e-12)
+    assert out["VOLUME"].tolist() == [0, 200, 300]
+
+
+# ---------------------------------------------------------------------------
 # download_batch: retry with exponential backoff
 # ---------------------------------------------------------------------------
 @pytest.fixture

@@ -191,6 +191,41 @@ def report_failed_batches(failed_batches: list) -> None:
     log.error("Re-run the script to fetch them.")
 
 
+PRICE_COLUMNS = ["TICKER", "DATE", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
+
+
+def clean_prices(df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    Normalise the concatenated tidy_batch output into the load-file schema
+    (PRICE_COLUMNS). Returns a new frame and leaves the input untouched;
+    returns None, after logging what was there instead, if a required
+    column is missing.
+    """
+    # Normalise column names: 'Adj Close' -> ADJ_CLOSE, 'Date' -> DATE
+    df = df.copy()
+    df.columns = [str(c).upper().replace(" ", "_") for c in df.columns]
+    if "DATE" not in df.columns and "DATETIME" in df.columns:
+        df = df.rename(columns={"DATETIME": "DATE"})
+    if "ADJ_CLOSE" not in df.columns and "CLOSE" in df.columns:
+        df["ADJ_CLOSE"] = df["CLOSE"]
+
+    missing = [c for c in PRICE_COLUMNS if c not in df.columns]
+    if missing:
+        log.error(f"Missing expected columns: {missing}")
+        log.error(f"Got: {list(df.columns)}")
+        return None
+
+    df = df[PRICE_COLUMNS].dropna(subset=["CLOSE"])
+    df["DATE"] = pd.to_datetime(df["DATE"], utc=True, errors="coerce").dt.date
+    df = df.dropna(subset=["DATE"])
+    df = df.drop_duplicates(subset=["TICKER", "DATE"], keep="last")
+
+    for col in ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE"]:
+        df[col] = df[col].astype(float).round(6)
+    df["VOLUME"] = df["VOLUME"].fillna(0).astype("int64")
+    return df
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the load files for the Snowflake Market Data Warehouse.")
@@ -236,30 +271,9 @@ def main(allow_fallback: bool = False) -> int:
         report_failed_batches(failed_batches)
         return 1
 
-    df = pd.concat(chunks, ignore_index=True)
-
-    # Normalise column names: 'Adj Close' -> ADJ_CLOSE, 'Date' -> DATE
-    df.columns = [str(c).upper().replace(" ", "_") for c in df.columns]
-    if "DATE" not in df.columns and "DATETIME" in df.columns:
-        df = df.rename(columns={"DATETIME": "DATE"})
-    if "ADJ_CLOSE" not in df.columns:
-        df["ADJ_CLOSE"] = df["CLOSE"]
-
-    wanted = ["TICKER", "DATE", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
-    missing = [c for c in wanted if c not in df.columns]
-    if missing:
-        log.error(f"Missing expected columns: {missing}")
-        log.error(f"Got: {list(df.columns)}")
+    df = clean_prices(pd.concat(chunks, ignore_index=True))
+    if df is None:
         return 1
-
-    df = df[wanted].dropna(subset=["CLOSE"])
-    df["DATE"] = pd.to_datetime(df["DATE"], utc=True, errors="coerce").dt.date
-    df = df.dropna(subset=["DATE"])
-    df = df.drop_duplicates(subset=["TICKER", "DATE"], keep="last")
-
-    for col in ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE"]:
-        df[col] = df[col].astype(float).round(6)
-    df["VOLUME"] = df["VOLUME"].fillna(0).astype("int64")
 
     # Report tickers with no price history rather than failing the batch
     # (tickers from failed batches are reported separately, below)
