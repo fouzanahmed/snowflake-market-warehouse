@@ -226,6 +226,21 @@ def clean_prices(df: pd.DataFrame) -> pd.DataFrame | None:
     return df
 
 
+def remove_stale_parts(out_dir: Path) -> list[Path]:
+    """
+    Delete FILE_PREFIX_*.csv.gz left in out_dir by an earlier run. Without
+    this, lowering N_OUTPUT_FILES leaves the old higher-numbered parts behind,
+    and the README's `PUT .../data/prices_*.csv.gz` glob uploads them too --
+    loading stale rows into RAW alongside the new ones. Returns what it removed.
+    """
+    removed = []
+    for path in sorted(out_dir.glob(f"{FILE_PREFIX}_*.csv.gz")):
+        path.unlink()
+        log.info(f"removed stale {path}")
+        removed.append(path)
+    return removed
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the load files for the Snowflake Market Data Warehouse.")
@@ -286,6 +301,10 @@ def main(allow_fallback: bool = False) -> int:
 
     # Shuffle, then split -- see module docstring for why
     df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+    # Clear old parts only now, once there is data to replace them with, so a
+    # failed run leaves the previous output intact.
+    remove_stale_parts(OUT_DIR)
 
     # Split row positions rather than the frame itself: on recent numpy/pandas,
     # np.array_split(df, n) returns bare ndarrays, which have no .to_csv.
