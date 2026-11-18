@@ -321,6 +321,41 @@ def test_main_ticker_dimension_excludes_tickers_without_history(run_main):
     assert dim["TICKER"].tolist() == ["AAA", "BBB", "CCC"]
 
 
+def test_main_removes_stale_parts_from_a_previous_run(run_main, tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    out_dir = tmp_path / "data"
+    out_dir.mkdir()
+    stale = out_dir / f"{fp.FILE_PREFIX}_99.csv.gz"
+    stale.write_bytes(b"left over from a run with more output files")
+    unrelated = out_dir / "notes.csv.gz"
+    unrelated.write_bytes(b"not a price part")
+
+    paths, _ = read_parts(run_main())
+
+    assert not stale.exists()
+    assert f"removed stale {stale}" in caplog.text
+    assert [p.name for p in paths] == [
+        f"{fp.FILE_PREFIX}_{k:02d}.csv.gz" for k in range(fp.N_OUTPUT_FILES)
+    ]
+    assert unrelated.exists()
+
+
+def test_main_keeps_previous_parts_when_run_fails(tmp_path, monkeypatch, sleeps):
+    out_dir = tmp_path / "data"
+    out_dir.mkdir()
+    previous = out_dir / f"{fp.FILE_PREFIX}_00.csv.gz"
+    previous.write_bytes(b"output of the last good run")
+    download, _ = flaky_download([RuntimeError("503")] * fp.MAX_ATTEMPTS)
+    monkeypatch.setattr(fp.yf, "download", download)
+    monkeypatch.setattr(fp, "get_constituents",
+                        lambda **_kwargs: pd.DataFrame({"TICKER": ["AAA"]}))
+    monkeypatch.setattr(fp.yf, "set_tz_cache_location", lambda _path: None)
+    monkeypatch.setattr(fp, "OUT_DIR", out_dir)
+
+    assert fp.main() == 1
+    assert previous.exists()
+
+
 def test_main_lists_batches_that_still_failed(run_main, monkeypatch, sleeps, caplog):
     def download(batch, **_kwargs):
         if "CCC" in batch:                      # second batch: CCC, NODATA
