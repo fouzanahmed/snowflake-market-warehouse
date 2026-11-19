@@ -37,6 +37,8 @@ Windows notes (both of these cost real debugging time):
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import sys
 import time
@@ -60,6 +62,7 @@ BACKOFF_BASE_S = 2.0  # waits 2s, 4s, 8s between attempts
 N_OUTPUT_FILES = 10
 OUT_DIR = Path("data")
 FILE_PREFIX = "prices"
+MANIFEST_NAME = "manifest.json"  # outside the prices_*.csv.gz glob, so never PUT
 TZ_CACHE = "./yf_cache"
 
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -241,6 +244,40 @@ def remove_stale_parts(out_dir: Path) -> list[Path]:
     return removed
 
 
+def sha256_file(path: Path) -> str:
+    """Hex sha256 of a file's bytes, read in chunks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_manifest(out_dir: Path, parts: list[tuple[Path, int]],
+                   df: pd.DataFrame) -> Path:
+    """
+    Write out_dir/MANIFEST_NAME: each part's file name, row count and sha256,
+    plus the totals from the 'Done.' log line. A record to reconcile against
+    COPY INTO's per-file rows_loaded. The name sits outside the
+    FILE_PREFIX_*.csv.gz glob, so remove_stale_parts leaves it alone (it is
+    simply overwritten) and the README's PUT never uploads it.
+    """
+    manifest = {
+        "files": [
+            {"file": path.name, "rows": rows, "sha256": sha256_file(path)}
+            for path, rows in parts
+        ],
+        "total_rows": len(df),
+        "tickers": int(df["TICKER"].nunique()),
+        "date_min": str(df["DATE"].min()),
+        "date_max": str(df["DATE"].max()),
+    }
+    path = out_dir / MANIFEST_NAME
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    log.info(f"wrote {path}  ({len(parts)} files)")
+    return path
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the load files for the Snowflake Market Data Warehouse.")
@@ -308,11 +345,15 @@ def main(allow_fallback: bool = False) -> int:
 
     # Split row positions rather than the frame itself: on recent numpy/pandas,
     # np.array_split(df, n) returns bare ndarrays, which have no .to_csv.
+    written = []
     for k, rows in enumerate(np.array_split(np.arange(len(df)), N_OUTPUT_FILES)):
         part = df.iloc[rows]
         path = OUT_DIR / f"{FILE_PREFIX}_{k:02d}.csv.gz"
         part.to_csv(path, index=False, compression="gzip")
         log.info(f"wrote {path}  ({len(part):,} rows)")
+        written.append((path, len(part)))
+
+    write_manifest(OUT_DIR, written, df)
 
     # Ticker dimension source, for the star schema
     dim_path = OUT_DIR / "tickers.csv.gz"
