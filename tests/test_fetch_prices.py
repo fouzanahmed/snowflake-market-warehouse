@@ -8,7 +8,9 @@ shaped like what yfinance returns with group_by='ticker'.
     pytest
 """
 
+import hashlib
 import importlib.util
+import json
 import logging
 from pathlib import Path
 
@@ -338,6 +340,33 @@ def test_main_removes_stale_parts_from_a_previous_run(run_main, tmp_path, caplog
         f"{fp.FILE_PREFIX}_{k:02d}.csv.gz" for k in range(fp.N_OUTPUT_FILES)
     ]
     assert unrelated.exists()
+
+
+def test_main_manifest_reconciles_with_parts(run_main):
+    out_dir = run_main()
+    manifest = json.loads((out_dir / fp.MANIFEST_NAME).read_text(encoding="utf-8"))
+    paths, parts = read_parts(out_dir)
+    combined = pd.concat(parts, ignore_index=True)
+
+    assert [f["file"] for f in manifest["files"]] == [p.name for p in paths]
+    assert sum(f["rows"] for f in manifest["files"]) == len(combined)
+    assert manifest["total_rows"] == len(combined)
+    for entry, path, part in zip(manifest["files"], paths, parts, strict=True):
+        assert entry["rows"] == len(part)
+        assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert manifest["tickers"] == combined["TICKER"].nunique() == 3
+    assert manifest["date_min"] == combined["DATE"].min()
+    assert manifest["date_max"] == combined["DATE"].max()
+
+
+def test_manifest_survives_stale_part_cleanup(tmp_path):
+    manifest = tmp_path / fp.MANIFEST_NAME
+    manifest.write_text("{}", encoding="utf-8")
+
+    fp.remove_stale_parts(tmp_path)
+
+    # Outside the prices_*.csv.gz glob: neither removed here nor PUT
+    assert manifest.exists()
 
 
 def test_main_keeps_previous_parts_when_run_fails(tmp_path, monkeypatch, sleeps):

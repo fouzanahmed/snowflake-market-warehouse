@@ -164,6 +164,10 @@ pip install -r requirements.txt
 python extract/fetch_prices.py          # ~5-10 min, writes data/*.csv.gz
 ```
 
+It also writes `data/manifest.json` (each part's row count and sha256, plus total
+rows, ticker count and date range) to reconcile against `COPY INTO`'s per-file
+`rows_loaded`; the `PUT` glob below doesn't match it, so it stays local.
+
 Then, in a Snowsight worksheet, run `sql/01` through `sql/03`.
 
 `PUT` is client-side and cannot run in a browser worksheet, so from SnowSQL:
