@@ -82,11 +82,33 @@ FALLBACK_TICKERS = [
 ]
 
 
+# Columns get_constituents() reads from the Wikipedia table.
+WIKI_REQUIRED_COLUMNS = ["Symbol", "Security", "GICS Sector"]
+# The index has ~500 members; far fewer means the wrong table was parsed.
+MIN_EXPECTED_CONSTITUENTS = 400
+
+
+def _fallback_constituents(allow_fallback: bool) -> pd.DataFrame | None:
+    """The hardcoded fallback if allow_fallback is set, else None (after logging why)."""
+    if not allow_fallback:
+        log.error(f"Not falling back to the {len(FALLBACK_TICKERS)} hardcoded tickers. "
+                  "Pass --allow-fallback to build from them anyway.")
+        return None
+    log.warning(f"Falling back to {len(FALLBACK_TICKERS)} hardcoded tickers "
+                "(--allow-fallback).")
+    return pd.DataFrame({
+        "TICKER": FALLBACK_TICKERS,
+        "COMPANY_NAME": [None] * len(FALLBACK_TICKERS),
+        "SECTOR": [None] * len(FALLBACK_TICKERS),
+    })
+
+
 def get_constituents(allow_fallback: bool = False) -> pd.DataFrame | None:
     """
-    S&P 500 constituents with sector. If the Wikipedia fetch fails, returns
-    the hardcoded fallback only when allow_fallback is set; otherwise None,
-    so the run stops instead of silently building a ~50-ticker dataset.
+    S&P 500 constituents with sector. If the Wikipedia fetch fails, or the
+    table no longer has the expected columns, returns the hardcoded fallback
+    only when allow_fallback is set; otherwise None, so the run stops instead
+    of silently building a ~50-ticker dataset.
     """
     try:
         resp = requests.get(
@@ -96,31 +118,33 @@ def get_constituents(allow_fallback: bool = False) -> pd.DataFrame | None:
         )
         resp.raise_for_status()
         table = pd.read_html(StringIO(resp.text))[0]
-
-        df = pd.DataFrame({
-            # BRK.B -> BRK-B : Yahoo uses hyphens for share classes
-            "TICKER": table["Symbol"].astype(str).str.replace(".", "-", regex=False),
-            "COMPANY_NAME": table["Security"].astype(str),
-            "SECTOR": table["GICS Sector"].astype(str),
-        }).drop_duplicates(subset=["TICKER"]).sort_values("TICKER")
-
-        log.info(f"Fetched {len(df)} constituents from Wikipedia")
-        return df.reset_index(drop=True)
-
     except Exception as exc:  # noqa: BLE001
         log.warning(f"Wikipedia fetch failed ({exc})")
         log.warning("Install an HTML parser to fix: pip install lxml html5lib beautifulsoup4")
-        if not allow_fallback:
-            log.error(f"Not falling back to the {len(FALLBACK_TICKERS)} hardcoded tickers. "
-                      "Pass --allow-fallback to build from them anyway.")
-            return None
-        log.warning(f"Falling back to {len(FALLBACK_TICKERS)} hardcoded tickers "
-                    "(--allow-fallback).")
-        return pd.DataFrame({
-            "TICKER": FALLBACK_TICKERS,
-            "COMPANY_NAME": [None] * len(FALLBACK_TICKERS),
-            "SECTOR": [None] * len(FALLBACK_TICKERS),
-        })
+        return _fallback_constituents(allow_fallback)
+
+    # Checked outside the try, so a layout change reports itself instead of
+    # surfacing as a bare KeyError with the HTML-parser hint above.
+    missing = [c for c in WIKI_REQUIRED_COLUMNS if c not in table.columns]
+    if missing:
+        log.error(f"Wikipedia constituents table is missing column(s) {missing}; "
+                  f"found {[str(c) for c in table.columns]}. The page layout has "
+                  "likely changed -- update WIKI_REQUIRED_COLUMNS / get_constituents().")
+        return _fallback_constituents(allow_fallback)
+
+    df = pd.DataFrame({
+        # BRK.B -> BRK-B : Yahoo uses hyphens for share classes
+        "TICKER": table["Symbol"].astype(str).str.replace(".", "-", regex=False),
+        "COMPANY_NAME": table["Security"].astype(str),
+        "SECTOR": table["GICS Sector"].astype(str),
+    }).drop_duplicates(subset=["TICKER"]).sort_values("TICKER")
+
+    log.info(f"Fetched {len(df)} constituents from Wikipedia")
+    if len(df) < MIN_EXPECTED_CONSTITUENTS:
+        log.warning(f"Only {len(df)} constituents parsed from Wikipedia (expected "
+                    f"at least {MIN_EXPECTED_CONSTITUENTS}); the first table on "
+                    "the page may not be the constituent list any more.")
+    return df.reset_index(drop=True)
 
 
 def tidy_batch(raw: pd.DataFrame, batch: list) -> pd.DataFrame:
