@@ -476,6 +476,83 @@ def test_main_allow_fallback_builds_from_fallback_tickers(
     assert set(pd.concat(parts)["TICKER"]) == {"AAA", "BBB"}
 
 
+# ---------------------------------------------------------------------------
+# Wikipedia table schema checks
+# ---------------------------------------------------------------------------
+class FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+def wiki_html(rows, headers=("Symbol", "Security", "GICS Sector")):
+    head = "".join(f"<th>{h}</th>" for h in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>" for row in rows)
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+@pytest.fixture
+def wikipedia_serves(monkeypatch):
+    def _serve(html):
+        monkeypatch.setattr(fp.requests, "get",
+                            lambda *_args, **_kwargs: FakeResponse(html))
+    return _serve
+
+
+SAMPLE_ROWS = [("BRK.B", "Berkshire Hathaway", "Financials"),
+               ("AAPL", "Apple Inc.", "Information Technology"),
+               ("XOM", "ExxonMobil", "Energy")]
+
+
+def test_get_constituents_renamed_column_logs_missing_and_found(
+        wikipedia_serves, caplog):
+    wikipedia_serves(wiki_html(SAMPLE_ROWS,
+                               headers=("Ticker", "Security", "GICS Sector")))
+
+    assert fp.get_constituents() is None
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    schema_error = next(m for m in errors if "missing column" in m)
+    assert "['Symbol']" in schema_error
+    assert "found ['Ticker', 'Security', 'GICS Sector']" in schema_error
+    # Not misreported as a fetch / parser failure
+    assert "Wikipedia fetch failed" not in caplog.text
+    assert "HTML parser" not in caplog.text
+
+
+def test_get_constituents_renamed_column_still_honours_fallback(
+        wikipedia_serves, caplog):
+    wikipedia_serves(wiki_html(SAMPLE_ROWS, headers=("Symbol", "Name", "Sector")))
+
+    df = fp.get_constituents(allow_fallback=True)
+
+    assert df["TICKER"].tolist() == fp.FALLBACK_TICKERS
+    assert "['Security', 'GICS Sector']" in caplog.text
+
+
+def test_get_constituents_warns_when_too_few_rows(wikipedia_serves, caplog):
+    wikipedia_serves(wiki_html(SAMPLE_ROWS))
+
+    df = fp.get_constituents()
+
+    assert df["TICKER"].tolist() == ["AAPL", "BRK-B", "XOM"]
+    assert list(df.columns) == ["TICKER", "COMPANY_NAME", "SECTOR"]
+    assert any(r.levelno == logging.WARNING and "Only 3 constituents" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_get_constituents_no_count_warning_for_a_full_table(
+        wikipedia_serves, monkeypatch, caplog):
+    monkeypatch.setattr(fp, "MIN_EXPECTED_CONSTITUENTS", 3)
+    wikipedia_serves(wiki_html(SAMPLE_ROWS))
+
+    assert len(fp.get_constituents()) == 3
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
 def test_parse_args_allow_fallback_flag():
     assert fp.parse_args([]).allow_fallback is False
     assert fp.parse_args(["--allow-fallback"]).allow_fallback is True
